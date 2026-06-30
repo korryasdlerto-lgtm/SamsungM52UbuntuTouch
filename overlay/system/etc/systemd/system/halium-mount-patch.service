@@ -1,0 +1,16 @@
+[Unit]
+Description=Bind-mount patched Android mount.sh
+Before=lxc-android-config.service
+After=mount-android-system.service mount-halium-overlay.service
+Requires=mount-android-system.service mount-halium-overlay.service
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/mount --bind /userdata/mount-patched-v3.sh /var/lib/lxc/android/mount.sh
+ExecStop=/bin/sh /userdata/lxc-mount-cleanup.sh
+ExecStop=/bin/umount /var/lib/lxc/android/mount.sh
+
+[Install]
+WantedBy=lxc-android-config.service
