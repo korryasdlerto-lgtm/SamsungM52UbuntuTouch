@@ -18,8 +18,13 @@
 
 | Image | Version |
 |---|---|
-| `halium_boot` | v31 |
+| `halium_boot` | v33 (custom kernel build, see below) |
 | `vendor_boot` | v16 (signed) |
+
+v33 is the first boot image built from a **locally rebuilt kernel** (not just a
+repacked cmdline) — see "Kernel config fix" below. v32 was an intermediate,
+cmdline-only test (`lsm=` override) that did **not** fix anything by itself;
+kept for the record but superseded by v33.
 
 ## Status
 
@@ -28,9 +33,10 @@
 | Boot (Ubuntu Touch) | ✅ Boots |
 | USB gadget (RNDIS) | ✅ Working |
 | SSH over USB | ✅ Stable |
-| LXC Android container | ✅ Boots and stays up |
+| LXC Android container | ✅ Boots and stays up (SELinux loop fixed, see below) |
 | Android property access (getprop, host-side) | ✅ Working |
-| Display (Lomiri/Mir) | 🔧 Graphics driver selected, GPU init blocked (see Known issues) |
+| Display (Lomiri/Mir) | 🔧 Mir selects the right driver and loads all vendor
+  libraries now; blocked on a GPU-level `/dev/kgsl-3d0` timeout (see Known issues) |
 | Wi-Fi | ❌ Not yet |
 | Calls / SMS | ❌ Not yet |
 | Camera | ❌ Not yet |
@@ -81,62 +87,129 @@
   not ship (it only has the AIDL `android.hardware.graphics.composer3`
   service). Install via `.deb` from `repo2.ubports.com`, matching the
   installed `libmirserver`/`libmirplatform` version exactly.
+- The Adreno EGL/GLES vendor libraries (`libEGL_adreno.so`,
+  `libGLESv2_adreno.so`, `libGLESv1_CM_adreno.so`) live in
+  `/vendor/lib64/egl/` on this device, but Mir's `graphics-android2`
+  platform (via libhybris) does a bare `dlopen()` that only searches
+  `/vendor/lib64/` directly, not the `egl/` subdirectory — same issue as
+  `eglSubDriverAndroid.so` (see above). Fixed by symlinking all three
+  directly into `/vendor/lib64/`.
+- Observed `/android/apex` mounted **twice** (two stacked `tmpfs`, confirmed
+  via `findmnt -A /android/apex`) after unmasking and restarting
+  `lxc-android-config.service` mid-session for testing. The second, empty
+  `tmpfs` shadows the working APEX bind-mounts underneath — `ls /android/apex`
+  shows empty even though the mounts are still there one layer down. Symptom:
+  `getprop`/anything needing host-side bionic fails again with `library
+  "libc.so" not found`, even though it worked right after boot. `mount-apexes.py`
+  *does* already guard against this with `os.path.ismount("/android/apex")`
+  (line 160) — so this needs more investigation (likely a mount-namespace/
+  propagation quirk when the mount-apexes service re-triggers via
+  `lxc-android-config.service`'s dependency chain, not a missing check).
+  Workaround: `sudo umount /android/apex` once to pop the shadowing layer.
+
+## Kernel config fix: SELinux was never compiled in (root cause of the vendor_init loop)
+
+The `vendor_init` SELinux loop described below (and the GPU chain that was
+blocked behind it) turned out to have a one-line root cause, found by
+grepping the actual kernel defconfig instead of trusting what earlier
+`.config` inspection suggested:
+
+```
+kernel/samsung/sm7325/arch/arm64/configs/vendor/lineage-m52xq_defconfig:6722
+# CONFIG_SECURITY_SELINUX is not set
+```
+
+**SELinux was not compiled into the kernel at all**, despite
+`CONFIG_DEFAULT_SECURITY_SELINUX=y` and a full set of `CONFIG_SECURITY_SELINUX_*`
+sub-options already present in the defconfig (dead weight without the parent
+option). This is why `/sys/fs/selinux` never got created no matter what
+userspace/LXC capability fixes were applied — the kernel had no SELinux LSM
+to register it. `androidboot.selinux=permissive` in the cmdline is a
+userspace/vendor_init hint only; it does nothing if the kernel can't back it.
+
+Fix: flip that one line to `CONFIG_SECURITY_SELINUX=y`, rebuild the kernel
+(`Image`), repack `boot.img` (kernel + same ramdisk/cmdline, header v3) →
+`halium_boot_v33.img`. AppArmor stays on (`CONFIG_SECURITY_APPARMOR=y`) since
+Ubuntu Touch itself needs it — this kernel supports full LSM stacking
+(confirmed via the string `LSM: security= is ignored because it is superseded
+by lsm=` present in the built kernel binary), and `CONFIG_LSM=` already lists
+both `selinux` and `apparmor`, so no cmdline change was actually required
+once the module itself was compiled in.
+
+**Result, confirmed after flashing v33 and testing under the watchdog:**
+`/sys/fs/selinux` now exists with a fully populated selinuxfs (`enforce`,
+`policy`, `booleans`, etc.), the `vendor_init` execcon retry loop is gone
+(0 occurrences vs. a 60+/2s runaway loop before), and
+`lxc-android-config.service` starts and stays running normally. An earlier
+attempt at a lighter fix — just adding `lsm=lockdown,yama,loadpin,safesetid,
+integrity,selinux,smack,tomoyo,apparmor` to `BOARD_KERNEL_CMDLINE` without
+rebuilding the kernel (`halium_boot_v32.img`) — was tested first and **did
+not help at all**; the loop reproduced identically. This makes sense in
+hindsight: `lsm=` only selects *which already-compiled* LSMs get initialized
+and in what order — it can't add a module that was never compiled in.
 
 ## Known issues
 
-- **GPU init (`/dev/kgsl-3d0`) fails with `ETIMEDOUT`** on first open
-  (`adreno_first_open` → GMU `PwrLimitsExitIdl` OOB timeout in
-  `drivers/gpu/msm/adreno_a6xx_gmu.c`). This chain of investigation goes
-  several layers deep - summary of what's confirmed so far, most recent first:
+- **GPU init (`/dev/kgsl-3d0`) fails with `ETIMEDOUT`** on open — confirmed via
+  `strace` on a manually-launched `lomiri-system-compositor` (with the SELinux
+  fix above in place, container running, and all vendor library path issues
+  fixed): `openat(AT_FDCWD, "/dev/kgsl-3d0", O_RDWR|O_SYNC) = -1 ETIMEDOUT`.
+  This is the same `adreno_first_open` → GMU `PwrLimitsExitIdl` OOB timeout
+  symptom seen at the very start of graphics bring-up, but now cleanly
+  isolated — it is the **only** remaining blocker in the Mir → EGL → GPU
+  chain (Mir now correctly selects the `ubports:android2` driver, finds and
+  loads all vendor EGL/GLES libraries, hwservicemanager/vndbinder/the AIDL
+  composer3 service are all up). Mir's own error at this point is
+  `must have at least EGL 1.4` (from `mir-android2-platform`'s
+  `gl_context.cpp`, `create_and_initialize_display()`) — `eglInitialize()`
+  succeeds but returns a version too low, consistent with EGL falling back
+  to a stub/null implementation once the real device open times out.
+  - GMU firmware blobs (`a660_gmu.bin`, `a660_sqe.fw`) **are** present at
+    `/vendor/firmware/`. Tried live-setting
+    `/sys/module/firmware_class/parameters/path` to `/vendor/firmware`
+    (cmdline has no `firmware_class.path=` at all, unlike the device's
+    stock/default `BOARD_KERNEL_CMDLINE`) — **no effect**, so either the
+    ZAP/GMU firmware load path doesn't go through the generic
+    `firmware_class` search at all (Qualcomm's PIL/`subsys-pil-tz`
+    mechanism may use a fixed/device-tree-driven path instead), or it's
+    only read once very early at boot before this could be changed live.
+  - No further forum/upstream precedent found for this exact combination
+    (Android 13, AIDL-only Composer3, `mir-android2-platform`, SM7325) as
+    of this writing — this looks like it needs kernel/device-tree-level
+    GMU power-sequencing work, not a userspace fix. Confirmed the kernel
+    itself has no local patches (`HEAD` matches upstream
+    `LineageOS/android_kernel_samsung_sm7325`'s `lineage-20` branch exactly).
 
-  1. **`vendor_init` SELinux domain transition fails, in a tight retry loop
-     with no backoff.** `init: Could not set execcon for 'u:r:vendor_init:s0':
+- ~~**`vendor_init` SELinux domain transition loop**~~ — **fixed**, see
+  "Kernel config fix" above. Keeping the original investigation notes below
+  since they document the (wrong) userspace-only diagnosis path and the
+  capability/mount fixes that were still worth keeping even though they
+  weren't the actual root cause:
+
+  1. `vendor_init` SELinux domain transition failed, in a tight retry loop
+     with no backoff: `init: Could not set execcon for 'u:r:vendor_init:s0':
      Invalid argument`. Android's init forks a restricted-privilege
      subprocess for vendor-originated commands (see [AOSP vendor init
      docs](https://source.android.com/docs/security/features/selinux/vendor-init)),
-     transitioning it into the `vendor_init` domain via `setexeccon()`. This
-     requires the domain to actually be loaded into the kernel's SELinux
-     policy state - if it isn't, the transition fails with EINVAL and
-     (this is the dangerous part) **init retries instantly, with no
-     backoff at all**, pegging a CPU core and generating real heat. This is
-     **not killable by killing a process** - it's PID 1 (inside the
-     container)'s own internal loop; the only way to stop it once started
-     is `lxc-stop -n android -k` (whole-container force stop). It also
-     appears capable of a hard system crash/watchdog-reset, not just a
-     hang - captured in `/sys/fs/pstore/console-ramoops-0` after one
-     occurrence. **Do not test this without a watchdog script running
-     dmesg -w and force-stopping the container on a sustained burst.**
+     transitioning it into the `vendor_init` domain via `setexeccon()`. Not
+     killable by killing a process - it's PID 1 (inside the container)'s own
+     internal loop; only `lxc-stop -n android -k` (whole-container force
+     stop) stops it. Capable of a hard system crash/watchdog-reset, captured
+     in `/sys/fs/pstore/console-ramoops-0` on one occurrence. **Still test
+     any container start/restart under the watchdog pattern below until
+     this has been re-verified stable over many boots.**
 
-  2. **Root cause of the domain never loading:** the container's
-     `/var/lib/lxc/android/config` has `lxc.cap.drop = mac_admin
-     mac_override`. `CAP_MAC_ADMIN` is required for `load_policy()` -
-     without it, Android's own init inside the container can never load
-     its SELinux policy into the (non-namespaced, kernel-wide) SELinux
-     subsystem in the first place, so *no* domain ever becomes valid, not
-     just `vendor_init`. Removing `mac_admin` from that line **does**
-     measurably help - `dmesg` shows `SELinux: Loaded file_contexts`
-     appearing where it didn't before - but the loop **still occurs**, just
-     with a different total count. Loading is at least partially
-     succeeding but something about it remains incomplete or wrong.
+  2. The container's `/var/lib/lxc/android/config` had `lxc.cap.drop =
+     mac_admin mac_override`. `CAP_MAC_ADMIN` is required for
+     `load_policy()`. Removing `mac_admin` **is still a required fix** (kept
+     in the shipped config) even though it turned out not to be sufficient
+     by itself — without the kernel fix above, this alone still left the
+     loop running, just with a different count.
 
-  3. **`/sys/fs/selinux` does not exist on the host even after the
-     `mac_admin` fix** (`mkdir /sys/fs/selinux` fails with EPERM - the
-     kernel never created the stub, meaning SELinux's own early-boot LSM
-     init never ran as an active module on this kernel, despite
-     `CONFIG_SECURITY_SELINUX=y` *and* `CONFIG_DEFAULT_SECURITY_SELINUX=y`
-     both being set in the kernel `.config`; `CONFIG_LSM=` lists both
-     `selinux` and `apparmor`). Yet `load_policy()` from inside the
-     container *does* partially work per point 2 above, apparently via a
-     path that doesn't require the `selinuxfs` mount. This is the
-     unresolved thread - why the stub directory is never created at boot,
-     and whether that's fixable from a boot cmdline change or genuinely
-     needs a kernel-side fix, is not yet determined. `/proc/cmdline` has
-     `androidboot.selinux=permissive` but no explicit `lsm=` override.
-
-  Given point 1's real crash/instability risk, **do not attempt to
-  reproduce or continue this investigation without the watchdog pattern
-  above**, and be aware it may require a kernel-level change (out of scope
-  for a live phone without a full backup/recovery plan).
+  3. `/sys/fs/selinux` not existing was the symptom that led to finding the
+     real root cause (kernel config, above) — kept here for the debugging
+     trail, since this is what a from-scratch investigation on a similar
+     device would hit first too.
 
   Earlier, separate finding (already fixed, unrelated to the above):
   `vndservicemanager` also used to fail to *link* at all -

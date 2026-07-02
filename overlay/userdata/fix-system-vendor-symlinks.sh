@@ -34,14 +34,23 @@ if [ -n "$CPID" ] && [ -d "/proc/$CPID/root/vendor" ]; then
         mkdir -p /userdata/vendor-real
         rsync -a "/proc/$CPID/root/vendor/" /userdata/vendor-real/
     fi
-    rm -f /vendor
+    # /vendor may already be a plain directory left over from a prior run of
+    # this script (not a symlink) - rm -f alone won't remove a non-empty dir.
+    if [ -L /vendor ] || [ ! -d /vendor ]; then
+        rm -f /vendor
+    elif ! mountpoint -q /vendor; then
+        rmdir /vendor 2>/dev/null || true
+    fi
     mkdir -p /vendor
     mountpoint -q /vendor || mount --bind /userdata/vendor-real /vendor
 
     # bionic's default library search path checks /vendor/lib64 directly,
-    # not /vendor/lib64/egl - the adreno EGL sub-driver dlopen()s by bare
-    # name and needs to be reachable there too.
-    ln -sf egl/eglSubDriverAndroid.so /vendor/lib64/eglSubDriverAndroid.so 2>/dev/null || true
+    # not /vendor/lib64/egl - the adreno EGL/GLES sub-drivers dlopen() by
+    # bare name and need to be reachable there too.
+    for lib in eglSubDriverAndroid.so libEGL_adreno.so libGLESv2_adreno.so \
+               libGLESv1_CM_adreno.so; do
+        ln -sf "egl/$lib" "/vendor/lib64/$lib" 2>/dev/null || true
+    done
 fi
 
 mount -o remount,ro /
