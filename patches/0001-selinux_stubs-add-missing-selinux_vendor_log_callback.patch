@@ -1,0 +1,10 @@
+diff --git a/stubs.c b/stubs.c
+index d0a324c..566dc6c 100644
+--- a/stubs.c
++++ b/stubs.c
+@@ -368,4 +368,5 @@ int selinux_android_set_sehandle(void) { return 0xDEADBEEF; }
+ int selinux_android_setcontext(void) { return 0xDEADBEEF; }
+ int selinux_android_vendor_service_context_handle(void) { return 0xDEADBEEF; }
+ int selinux_log_callback(int type, const char *fmt, ...) { return 0; }
++int selinux_vendor_log_callback(int type, const char *fmt, ...) { return 0; }
+ 

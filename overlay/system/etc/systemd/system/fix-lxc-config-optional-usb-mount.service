@@ -1,0 +1,12 @@
+[Unit]
+Description=Add optional flag to missing USB HAL mount.entry in LXC android config
+Before=lxc-android-config.service
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh /userdata/fix-lxc-config-optional-usb-mount.sh
+
+[Install]
+WantedBy=lxc-android-config.service
