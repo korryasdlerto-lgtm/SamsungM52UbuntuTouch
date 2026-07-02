@@ -86,28 +86,72 @@
 
 - **GPU init (`/dev/kgsl-3d0`) fails with `ETIMEDOUT`** on first open
   (`adreno_first_open` → GMU `PwrLimitsExitIdl` OOB timeout in
-  `drivers/gpu/msm/adreno_a6xx_gmu.c`). Root cause found: `vndservicemanager`
-  (inside the LXC container) fails to start — `CANNOT LINK EXECUTABLE
-  ".../vndservicemanager": cannot locate symbol "selinux_vendor_log_callback"`
-  — because the currently-installed `/system/lib64/libselinux.so` predates
-  this symbol being added to `external/selinux/libselinux`. This crash-loops
-  `vndservicemanager` (and by extension the whole `hal` service class,
-  including the display composer) every ~5s via
-  `onrestart class_restart hal`, which is very likely why the GPU/GMU power
-  state never stabilizes.
-  - The missing symbol **does** exist in this tree's
-    `external/selinux/libselinux` source (`src/android/android.c`) — a
-    straight rebuild+swap of `libselinux.so` fixes `vndservicemanager`, but
-    introduced a **new, tighter** crash loop elsewhere (`init: Could not set
-    execcon for 'u:r:vendor_init:s0'`), i.e. the freshly-built `libselinux.so`
-    is not fully ABI-compatible with whatever this device's other prebuilt
-    binaries (at least `init`) expect. **Do not swap the whole library** —
-    reverted, not shipped. The correct fix is a surgical binary patch that
-    adds *only* the missing symbol to the existing installed `.so` (e.g. via
-    an `objcopy`/linker script based symbol injection) rather than a full
-    rebuild from current source. Not yet done — see `patches/` for the
-    (safe, tested, but insufficient on its own) `selinux_stubs` fix, and the
-    notes above for what's actually needed next.
+  `drivers/gpu/msm/adreno_a6xx_gmu.c`). This chain of investigation goes
+  several layers deep - summary of what's confirmed so far, most recent first:
+
+  1. **`vendor_init` SELinux domain transition fails, in a tight retry loop
+     with no backoff.** `init: Could not set execcon for 'u:r:vendor_init:s0':
+     Invalid argument`. Android's init forks a restricted-privilege
+     subprocess for vendor-originated commands (see [AOSP vendor init
+     docs](https://source.android.com/docs/security/features/selinux/vendor-init)),
+     transitioning it into the `vendor_init` domain via `setexeccon()`. This
+     requires the domain to actually be loaded into the kernel's SELinux
+     policy state - if it isn't, the transition fails with EINVAL and
+     (this is the dangerous part) **init retries instantly, with no
+     backoff at all**, pegging a CPU core and generating real heat. This is
+     **not killable by killing a process** - it's PID 1 (inside the
+     container)'s own internal loop; the only way to stop it once started
+     is `lxc-stop -n android -k` (whole-container force stop). It also
+     appears capable of a hard system crash/watchdog-reset, not just a
+     hang - captured in `/sys/fs/pstore/console-ramoops-0` after one
+     occurrence. **Do not test this without a watchdog script running
+     dmesg -w and force-stopping the container on a sustained burst.**
+
+  2. **Root cause of the domain never loading:** the container's
+     `/var/lib/lxc/android/config` has `lxc.cap.drop = mac_admin
+     mac_override`. `CAP_MAC_ADMIN` is required for `load_policy()` -
+     without it, Android's own init inside the container can never load
+     its SELinux policy into the (non-namespaced, kernel-wide) SELinux
+     subsystem in the first place, so *no* domain ever becomes valid, not
+     just `vendor_init`. Removing `mac_admin` from that line **does**
+     measurably help - `dmesg` shows `SELinux: Loaded file_contexts`
+     appearing where it didn't before - but the loop **still occurs**, just
+     with a different total count. Loading is at least partially
+     succeeding but something about it remains incomplete or wrong.
+
+  3. **`/sys/fs/selinux` does not exist on the host even after the
+     `mac_admin` fix** (`mkdir /sys/fs/selinux` fails with EPERM - the
+     kernel never created the stub, meaning SELinux's own early-boot LSM
+     init never ran as an active module on this kernel, despite
+     `CONFIG_SECURITY_SELINUX=y` *and* `CONFIG_DEFAULT_SECURITY_SELINUX=y`
+     both being set in the kernel `.config`; `CONFIG_LSM=` lists both
+     `selinux` and `apparmor`). Yet `load_policy()` from inside the
+     container *does* partially work per point 2 above, apparently via a
+     path that doesn't require the `selinuxfs` mount. This is the
+     unresolved thread - why the stub directory is never created at boot,
+     and whether that's fixable from a boot cmdline change or genuinely
+     needs a kernel-side fix, is not yet determined. `/proc/cmdline` has
+     `androidboot.selinux=permissive` but no explicit `lsm=` override.
+
+  Given point 1's real crash/instability risk, **do not attempt to
+  reproduce or continue this investigation without the watchdog pattern
+  above**, and be aware it may require a kernel-level change (out of scope
+  for a live phone without a full backup/recovery plan).
+
+  Earlier, separate finding (already fixed, unrelated to the above):
+  `vndservicemanager` also used to fail to *link* at all -
+  `CANNOT LINK EXECUTABLE ".../vndservicemanager": cannot locate symbol
+  "selinux_vendor_log_callback"` - because the installed
+  `/system/lib64/libselinux.so` (actually bind-mounted from
+  `/userdata/libselinux-stub.so`, an existing halium mechanism, not
+  something this port added) predates that symbol existing in
+  `external/selinux/libselinux`. Fixed live by adding the missing symbol
+  and swapping the file in-place (atomically, via temp-file + `mv` in the
+  same directory - a plain non-atomic overwrite while the file is mapped by
+  running processes corrupts it and crashes unrelated things). This
+  specific fix is stable and did not itself cause point 1-3 above; it just
+  allowed execution to *reach* the vendor_init issue instead of dying
+  earlier for an unrelated reason.
   - `vendor/halium/selinux_stubs/stubs.c` *also* has an analogous bug
     (declares `selinux_vendor_log_callback` in `libselinux_stubs.map.txt`
     without implementing it) — fixed safely in
@@ -147,6 +191,11 @@ device-config/                ← reference copies of the exact kernel defconfig
                                  current build (halium_boot v31 / vendor_boot v16)
   kernel/lineage-m52xq_defconfig
   device-tree/BoardConfig.mk, device.mk, lineage_m52xq.mk, ...
+
+tools/                        ← diagnostic tools, not deployed automatically
+  vendor-init-loop-watchdog.sh ← required before touching the vendor_init
+                                 SELinux loop (see Known issues) - it's not
+                                 killable by killing a process
 ```
 
 ## Installation

@@ -1,0 +1,8 @@
+Deploy to /userdata/, then before ANY manual test that touches the GPU or
+restarts the LXC container:
+
+    sudo sh -c 'setsid nohup sh /userdata/vendor-init-loop-watchdog.sh > /dev/null 2>&1 < /dev/null &'
+
+It watches dmesg for the "Restarting subcontext" tight-loop pattern (see
+README.md Known issues) and force-stops the container if a burst is
+detected, since the loop itself is not killable by killing a process.

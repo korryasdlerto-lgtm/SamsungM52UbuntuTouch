@@ -6,13 +6,19 @@ After=mount-android-system.service
 After=mount-android-partitions.service
 Before=sysinit.target
 
-ConditionPathIsDirectory=/android/apex
-
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# Upstream gates this unit on /android/apex already existing
+# (ConditionPathIsDirectory=/android/apex), but nothing else on this device
+# ever creates that directory - the condition just permanently skips the
+# unit. Create it ourselves instead of depending on it pre-existing.
+ExecStartPre=/bin/mkdir -p /android/apex
 ExecStart=/usr/libexec/lxc-android-config/mount-apexes.py \
     "com.android.runtime" \
     "com.android.art" \
     "com.android.i18n" \
     "com.android.vndk.*"
+
+[Install]
+WantedBy=multi-user.target
