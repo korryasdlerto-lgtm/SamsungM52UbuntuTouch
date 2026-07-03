@@ -16,15 +16,17 @@
 
 ## Boot images in use
 
-| Image | Version |
-|---|---|
-| `halium_boot` | v33 (custom kernel build, see below) |
-| `vendor_boot` | v16 (signed) |
+| Image | Version | File |
+|---|---|---|
+| `halium_boot` | v38 | [`images/halium_boot_v38.img`](images/halium_boot_v38.img) |
+| `vendor_boot` | v16 (signed) | [`images/vendor_boot_v16_signed.img`](images/vendor_boot_v16_signed.img) |
 
-v33 is the first boot image built from a **locally rebuilt kernel** (not just a
-repacked cmdline) — see "Kernel config fix" below. v32 was an intermediate,
-cmdline-only test (`lsm=` override) that did **not** fix anything by itself;
-kept for the record but superseded by v33.
+v38 has `CONFIG_SECURITY_SELINUX=y` (see "Kernel config fix" below — this is
+the confirmed-working setting; a same-day follow-up attempt to fully compile
+SELinux *out* of the kernel entirely, v39, caused a total boot failure — see
+"Do not retry" note below) plus the same ramdisk/cmdline as the v33-era
+working build. `vendor_boot` (DTB + vendor ramdisk) has not needed to change
+since v16 and is not rebuilt alongside every `halium_boot` bump.
 
 ## Status
 
@@ -35,8 +37,8 @@ kept for the record but superseded by v33.
 | SSH over USB | ✅ Stable |
 | LXC Android container | ✅ Boots and stays up (SELinux loop fixed, see below) |
 | Android property access (getprop, host-side) | ✅ Working |
-| Display (Lomiri/Mir) | 🔧 Mir selects the right driver and loads all vendor
-  libraries now; blocked on a GPU-level `/dev/kgsl-3d0` timeout (see Known issues) |
+| `vendor.qti.hardware.display.composer` / `vndservicemanager` | ✅ Fixed — see "vndservicemanager crash-loop fix" below |
+| Display (Lomiri/Mir) | 🔧 Blocked on `HidlComposer::createClient()` returning no client (`failed to create composer client`, `LOG_ALWAYS_FATAL` abort) — see Known issues. A prior session reported reaching a later-stage `/dev/kgsl-3d0` GPU timeout instead; not yet reconciled whether that was a different live state or this composer-client issue is itself new/regressed. |
 | Wi-Fi | ❌ Not yet |
 | Calls / SMS | ❌ Not yet |
 | Camera | ❌ Not yet |
@@ -147,6 +149,104 @@ rebuilding the kernel (`halium_boot_v32.img`) — was tested first and **did
 not help at all**; the loop reproduced identically. This makes sense in
 hindsight: `lsm=` only selects *which already-compiled* LSMs get initialized
 and in what order — it can't add a module that was never compiled in.
+
+**Do not retry fully compiling SELinux back out of the kernel.** A same-day
+follow-up experiment (v39) went the other direction — `CONFIG_SECURITY_SELINUX`
+set to `is not set` again, hoping to sidestep SELinux instead of fixing it —
+under the theory that our `libselinux-stub.so` bind-mount (see below) makes a
+real kernel policy unnecessary. This **caused a total boot failure**: no USB
+gadget, no SSH, confirmed via TWRP pstore capture (`/sys/fs/pstore/console-ramoops-0`,
+works even when the flashed boot is fully hung) to be a ~800/sec tight
+fork-loop — `init: Could not set execcon for 'u:r:vendor_init:s0': Invalid
+argument` / `init: Restarting subcontext 'u:r:vendor_init:s0'` — pegging the
+CPU so hard nothing else (including USB enumeration) could proceed. Root
+cause: Android init's `SubcontextProcess` mechanism does a **direct `write()`
+to `/proc/thread-self/attr/exec`**, not a dynamic `libselinux.so` call, so no
+userspace stub can intercept it — the kernel LSM has to actually be present
+(even policy-less) for that write to be tolerated instead of hard-EINVALing
+every single time with no backoff. Reverted same-day back to
+`CONFIG_SECURITY_SELINUX=y`, re-flashed v38, confirmed working again.
+
+## vndservicemanager crash-loop fix (composer `service_manager` class)
+
+Even with the kernel SELinux fix above and `/sys/fs/selinux` present, no
+*policy* is ever loaded into it (Halium's boot flow execs straight into
+`/init second_stage`, skipping Android init's dedicated `/init selinux_setup`
+stage — confirmed via `/usr/libexec/lxc-android-config/start-android-container`).
+`/sys/fs/selinux/class/` has 0 entries. This broke `vndservicemanager`'s
+per-call authorization: `frameworks/native/cmds/servicemanager/Access.cpp`'s
+`canAdd()`/`canFind()` resolve a security class by string
+(`string_to_security_class("service_manager")`), which can't succeed with no
+policy loaded, and the real (stock Samsung) binary at `/vendor/bin/vndservicemanager`
+fails closed on that — every `addService()`/`getService()` call gets denied.
+This specifically broke `vendor.qti.hardware.display.composer`'s self-registration
+(`HWCSession::Init()` → `qService::init()` registers `"display.qservice"` then
+immediately self-looks-it-up via `getService()` on `/dev/vndbinder` — the
+lookup returns NULL, `HWCSession::Init()` returns `-EINVAL`, which the shell
+reports as exit status 234 = `256 - 22`) in a tight ~5.2s restart loop, taking
+`surfaceflinger`/`zygote`/`netd`/`gpu`/`mediametrics`/`wificond` down with it
+via `onrestart class_restart hal`.
+
+Our own AOSP tree already has the intended Halium fix for this
+(`Access.cpp`'s `actionAllowed()`/`actionAllowedFromLookup()` both start with
+`// Disabled for Halium` + `return true;`, unconditionally allowing every
+call) — it was just never compiled into a binary actually running on the
+device, since `/vendor` is stock Samsung's untouched image. The *official*
+Halium mechanism for getting a fixed `libselinux` into `vndservicemanager` is
+`LD_PRELOAD` of `libselinux_stubs.so` (see `hybris-patches/system/linkerconfig/`
+in this repo — needs a linkerconfig namespace patch to permit the cross-namespace
+load into the VNDK vendor namespace at all, which is also why our older
+`libselinux-stub.so` bind-mount-over-the-real-`.so`-path trick never actually
+took effect for `vndservicemanager`/vendor-namespace processes in the first
+place — Treble VNDK linker namespacing does its own separate resolution).
+
+**Fix applied**: built `vndservicemanager` directly from our own
+already-patched source (`make vndservicemanager` after `lunch
+lineage_m52xq-userdebug`) and bind-mounted the resulting binary over the
+stock one — see `overlay/userdata/vndservicemanager-halium` in this repo, and
+add this line to `mount-patched-v3.sh` right after the `/dev/mapper/vendor`
+mount (needs `/vendor` mounted first):
+```sh
+mount --bind /userdata/vndservicemanager-halium "${R}/vendor/bin/vndservicemanager" 2>/dev/null || true
+```
+Since this binary has `return true;` hardcoded in its own authorization
+logic, it doesn't need `libselinux`/the stub/`LD_PRELOAD` at all — more
+robust than the official mechanism, and confirms independently the same
+approach used by the closest comparable device with a genuinely working
+Ubuntu Touch port, the Nothing Phone 1 ("spacewar", also Snapdragon
+778G/SM7325) — its `github.com/Nonta72/nothing-spacewar` overlay ships the
+exact same `vendor/bin/vndservicemanager` binary-replacement pattern.
+
+**Confirmed working**: `vendor.qti.hardware.display.composer-service` and
+`surfaceflinger` both stayed up 35+ seconds with zero restarts (was crashing
+every ~5.2s before). `logcat` confirms the old failure signature
+(`qdqservice: Adding display.qservice failed` → `Service display.qservice
+didn't start. Returning NULL` → `HWCSession::Init: Failed to acquire
+display.qservice`) is gone.
+
+**New, later-stage blocker** (not yet fixed): `lomiri-system-compositor` now
+fails fast (~0.2s, SIGABRT) with `failed to create composer client` instead —
+real progress (past the old failure point), but a new wall. Traced to
+`HidlComposerHal.cpp:230`, `HidlComposer::HidlComposer()`:
+`IComposer::getService()` now succeeds, but the follow-up `createClient()`
+HIDL call never sets a client (`Error != NONE`, silently — the AOSP code
+doesn't log which error), so `LOG_ALWAYS_FATAL("failed to create composer
+client")` aborts. Ruled out: `surfaceflinger` holding the client first
+(tested with `kill -STOP` on its PID for the duration of a manual
+`lomiri-system-compositor --debug-without-dm ...` test — same failure with it
+fully paused); kernel-level binder/SELinux denial (`dmesg` has zero `avc:`
+messages the whole session, consistent with no policy meaning nothing to
+check against; `strace -f -p <composer-service-pid>` during a live attempt
+showed all `BINDER_WRITE_READ` ioctls returning `0` — the transport-level
+IPC completes fine, the rejection is purely inside the closed-source Qualcomm
+SDM composer implementation). Not yet confirmed: whether the calling
+identity matters — our test (and the real `lightdm.service`, which also has
+no `User=`/`Group=` set) calls the compositor as host-side root (uid 0),
+which lacks the `android_graphics`/`android_input` supplementary groups the
+`phablet` user has; testing as `phablet` gets blocked even earlier by a
+*different* problem (`must have at least EGL 1.4`, DRM master claim fails
+without root) before it can even reach the composer-client stage, so this
+remains an open, untested lead rather than a confirmed cause.
 
 ## Known issues
 
