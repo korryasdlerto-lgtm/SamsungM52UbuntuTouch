@@ -18,10 +18,10 @@
 
 | Image | Version | File |
 |---|---|---|
-| `halium_boot` | v38 | [`images/halium_boot_v38.img`](images/halium_boot_v38.img) |
+| `halium_boot` | v40 | [`images/halium_boot_v40.img`](images/halium_boot_v40.img) |
 | `vendor_boot` | v16 (signed) | [`images/vendor_boot_v16_signed.img`](images/vendor_boot_v16_signed.img) |
 
-v38 has `CONFIG_SECURITY_SELINUX=y` (see "Kernel config fix" below — this is
+v40 has `CONFIG_SECURITY_SELINUX=y` (see "Kernel config fix" below — this is
 the confirmed-working setting; a same-day follow-up attempt to fully compile
 SELinux *out* of the kernel entirely, v39, caused a total boot failure — see
 "Do not retry" note below) plus the same ramdisk/cmdline as the v33-era
@@ -248,6 +248,125 @@ which lacks the `android_graphics`/`android_input` supplementary groups the
 without root) before it can even reach the composer-client stage, so this
 remains an open, untested lead rather than a confirmed cause.
 
+## Android-side zygote64 / system_server boot chain (telephony/RIL track)
+
+This is a **separate, parallel track** from the Lomiri/Mir display work
+above: telephony (SIM/RIL, `phone`/`isub` services) needs the actual Android
+`zygote64` → `system_server` Java stack to come up inside the LXC container,
+independent of whether a real display/SurfaceFlinger exists. Screen
+rendering stays on the hybris/Mir path either way, unaffected by any of
+this.
+
+Starting point this round was zygote64 dying instantly with
+`NoClassDefFoundError` on `SystemServiceRegistry`'s static init. Fixed, in
+order (each confirmed via reboot + logcat, most via dexlib2 bytecode
+patching of `framework.jar`/`services.jar` since a full AOSP rebuild wasn't
+always practical mid-chain — patched jars are shipped in `builds/userdata/`,
+see below):
+
+1. `SystemServiceRegistry.<clinit>` aborted the whole class on the first
+   APEX-only service class it couldn't resolve (`TetheringManager`, etc.) —
+   wrapped the registration calls in try/catch instead of letting one
+   missing service kill every other service's registration.
+2. `ActivityThread.initializeMainlineModules()` had the same problem for
+   `BluetoothFrameworkInitializer` — same try/catch treatment, plus a
+   standalone `framework-bluetooth-stub.jar` added to `BOOTCLASSPATH` so the
+   class at least resolves (doesn't need to fully function yet).
+3. `AppRestrictionController`'s `RoleManager`-dependent lambda field
+   initializer crashed `ActivityManagerService`'s construction — NOP'd out
+   via raw binary dex patching (dexlib2's `DexPool.writeTo()` reliably
+   *corrupts* `services.jar`'s large classes.dex on any round-trip, even
+   completely unchanged — raw byte patching with checksum/SHA1 recompute is
+   the only thing that worked for this specific file).
+4. Native `SurfaceComposerClient.cpp`: ~20+ call sites that dereference
+   `ComposerService::getComposerService()`/`ComposerServiceAIDL::getComposerService()`
+   without a null check (crash after crash, one function at a time) — this
+   device's Halium fork stubs out the real SurfaceFlinger connection
+   entirely (by design — see the top of this README), so every caller needs
+   to handle a null composer service gracefully. Also fabricated a complete
+   **fake default display** (real M52 5G panel specs: 1080×2400, density
+   420) so `DisplayManagerService`'s `WaitForDisplay` boot phase succeeds in
+   ~20ms instead of timing out at 10s or segfaulting — this alone was
+   previously unsolved upstream for this class of device.
+   - Regression caught and fixed *this* session: stubbing
+     `ComposerServiceAIDL::connectLocked()` by fully deleting its
+     `waitForService<gui::ISurfaceComposer>()` call (to avoid a real
+     indefinite hang, since that AIDL path was never stubbed by upstream)
+     silently dropped `libgui.so`'s only reference to
+     `gui::ISurfaceComposer::asInterface`/`BnScreenCaptureListener::onTransact`
+     — Soong's `static_libs` (unlike `whole_static_libs`) only pulls in
+     archive members that are actually referenced, so those symbols vanished
+     from the exported `.so` even though `libandroid_runtime.so`/
+     `libstagefright.so` still need them (`CANNOT LINK EXECUTABLE`,
+     `app_process64`/`camera_service`/`mediaextractor` crash-looping). Fixed
+     by using `checkService()` (non-blocking, returns null immediately)
+     instead of deleting the call outright — keeps the symbol reference
+     alive for the linker while still avoiding any hang. **Lesson: never
+     just delete/comment-out a call to a real AIDL/HIDL interface type in
+     this codebase to "stub" it — always route through some real call
+     (checkService, a stub returning null, etc.) that keeps the compiler
+     referencing the interface, or the shared library's exported ABI
+     silently breaks for every *other* library that links against it.**
+5. `LocalDisplayAdapter`/`Choreographer`/`WindowAnimator`:
+   `DisplayEventReceiver.nativeInit()` always fails (`status=-19`/ENODEV, no
+   real vsync source) and threw uncaught from every caller. Fixed at the
+   root in `DisplayEventReceiver.java`'s constructor (catch + leave
+   `mReceiverPtr = 0`, matching the null-ptr handling `scheduleVsync()`
+   already had) instead of patching every individual caller one at a time.
+6. zygote's native FD allowlist (`frameworks/base/core/jni/fd_utils.cpp`)
+   only accepted APEX jar paths under `/apex/...`, not `/system/apex/...`
+   (where our APEX content actually lives, since `apexd` never truly
+   activates most APEXes here — see point 8) — zygote aborted with `Not
+   allowlisted` trying to keep those FDs open across fork. Extended the
+   allowlist check to also accept the `/system/apex/**/javalib/*.jar` form.
+7. `RuntimePermissionsPersistence`/`RuntimePermissionsPersistenceImpl`
+   (`NoClassDefFoundError` in `PackageManagerService`'s constructor) turned
+   out to be a classpath **misclassification**, not a missing file:
+   `service-permission.jar` was wired into `STANDALONE_SYSTEMSERVER_JARS`
+   (its own child classloader, invisible to `services.jar`'s direct
+   constructor call), but AOSP's own
+   `build/make/target/product/default_art_config.mk` lists
+   `com.android.permission:service-permission` under
+   `PRODUCT_APEX_SYSTEM_SERVER_JARS` — the *main*, non-standalone list.
+   Moved it to `SYSTEMSERVERCLASSPATH` in `mount.sh` to match stock AOSP's
+   actual classloader wiring.
+8. `PackageManagerService` threw `Required services extension package is
+   missing, check config_servicesExtensionPackage` because `apexd` here only
+   ever "activates" `com.android.apex.cts.shim.apex` (the one real `.apex`
+   file on `/system/apex/`; everything else — wifi, permission, extservices,
+   tethering, etc. — is a pre-extracted *directory* we bind-mount by hand,
+   invisible to apexd's own internal Binder-queried active-package state).
+   `getApexScanPartitions()`/`ApexManager.getActiveApexInfos()` normally
+   calls the real `apexd` over Binder for this — but AOSP ships a second
+   implementation, `ApexManagerFlattenedApex`, specifically for devices
+   without updatable APEX support: it just globs `/apex/*` directories
+   directly, no `apexd` involved at all. Forced this path by setting
+   `ro.apex.updatable=false` (`ro.*` is write-once/first-writer-wins, and
+   `/vendor/build.prop` — the only place this device sets it to `true` — is
+   patched at that exact line in `mount.sh` rather than raced against via
+   load order). `com.android.extservices` also needed adding to the
+   already-existing simple whole-APEX-directory bind-mount loop (unlike
+   `com.android.tethering`, we *do* want `extservices`'s `priv-app/` scanned
+   — that's the actual `android.ext.services` package
+   `config_servicesExtensionPackage` needs).
+
+**Status at last checkpoint: very close.** `PackageManagerService` now
+constructs fully (was previously the hard stop), `ActivityManagerService`
+starts, boot reaches `WindowManager`/`Choreographer` init. Point 5 above
+(the `DisplayEventReceiver` fix) was written and rebuilt as a source-level
+`frameworks/base` fix but **not yet freshly deployed/reboot-tested** at the
+moment of this commit — see `patches/0003-frameworks_base-zygote64-system_server-boot-fixes.patch`.
+Next reboot should tell us if this clears the last known crash or surfaces
+another one further down the `SystemServer.startBootstrapServices()`/
+`startCoreServices()`/`startOtherServices()` chain. `builds/userdata/`
+contains the exact deployed artifacts (patched `framework.jar`/`services.jar`,
+`libgui.so` v7, `libandroid_runtime.so` v1, etc.) and
+`overlay/userdata/mount.sh` is the full, currently-live LXC container-start
+hook with every fix above wired in — treat it as the
+single source of truth for the current live device state, since a lot of
+this was iterated live via `ssh`+bind-mounts faster than full rebuild
+cycles allowed.
+
 ## Known issues
 
 - **GPU init (`/dev/kgsl-3d0`) fails with `ETIMEDOUT`** on open — confirmed via
@@ -353,15 +472,40 @@ overlay/userdata/             ← deployed to /userdata/ on device
   fix-lxc-config-optional-usb-mount.sh ← the very first LXC-container-won't-
                                  start fix (see notes above)
   lxc-mount-cleanup.sh         ← lazy-unmounts LXC bind mounts before restart
+  mount.sh                     ← THE LXC container-start hook (/var/lib/lxc/
+                                 android/mount.sh) — every zygote64/
+                                 system_server boot fix from this session is
+                                 wired in here as a bind-mount over the real
+                                 /system|/vendor file, plus BOOTCLASSPATH/
+                                 SYSTEMSERVERCLASSPATH construction and prop
+                                 overrides. Single most load-bearing file in
+                                 this repo for the telephony/RIL track.
 
 patches/                      ← patches against AOSP source trees in this
                                  manifest (NOT part of the overlay - apply
                                  and rebuild the relevant module)
   0001-selinux_stubs-...patch  ← vendor/halium/selinux_stubs missing stub fix
+  0002-frameworks_native-...patch ← fake default display + composer
+                                 null-checks (frameworks/native/libs/gui)
+  0003-frameworks_base-...patch ← zygote64/system_server boot fixes
+                                 (fd_utils.cpp allowlist, DisplayEventReceiver,
+                                 LocalDisplayAdapter, SurfaceControl)
 
-device-config/                ← reference copies of the exact kernel defconfig
+builds/userdata/               ← exact deployed build artifacts (patched
+                                 framework.jar/services.jar, libgui.so,
+                                 libandroid_runtime.so, vndservicemanager,
+                                 boot-framework.{oat,art,vdex}) — reproducing
+                                 these from source means re-applying dexlib2
+                                 bytecode patches on top of a fresh AOSP
+                                 build (see zygote64/system_server section
+                                 above); these binaries are the actual
+                                 last-known-good/in-progress state, kept here
+                                 since the source-only patches don't capture
+                                 the bytecode-level fixes
+
+device-config/                 ← reference copies of the exact kernel defconfig
                                  and core device tree makefiles used for the
-                                 current build (halium_boot v31 / vendor_boot v16)
+                                 current build (halium_boot v40 / vendor_boot v16)
   kernel/lineage-m52xq_defconfig
   device-tree/BoardConfig.mk, device.mk, lineage_m52xq.mk, ...
 

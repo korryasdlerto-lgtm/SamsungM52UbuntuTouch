@@ -1,0 +1,95 @@
+diff --git a/core/java/android/view/DisplayEventReceiver.java b/core/java/android/view/DisplayEventReceiver.java
+index 3a74b2ed63a7..fcd006a0ad8f 100644
+--- a/core/java/android/view/DisplayEventReceiver.java
++++ b/core/java/android/view/DisplayEventReceiver.java
+@@ -110,8 +110,20 @@ public abstract class DisplayEventReceiver {
+         }
+ 
+         mMessageQueue = looper.getQueue();
+-        mReceiverPtr = nativeInit(new WeakReference<DisplayEventReceiver>(this), mMessageQueue,
+-                vsyncSource, eventRegistration);
++        long receiverPtr = 0;
++        try {
++            receiverPtr = nativeInit(new WeakReference<DisplayEventReceiver>(this), mMessageQueue,
++                    vsyncSource, eventRegistration);
++        } catch (RuntimeException e) {
++            // Halium: no real vsync source (SurfaceFlinger is not running), nativeInit()
++            // always fails with status=-19/ENODEV here. Every caller of this constructor
++            // (Choreographer, WindowAnimator, VSyncSampler, etc.) treats a failed init as
++            // fatal by default -- leave mReceiverPtr at 0 (same state as after dispose())
++            // so scheduleVsync()/dispose() already handle it via their existing null checks.
++            Log.w(TAG, "Failed to initialize display event receiver, no vsync events will be "
++                    + "delivered", e);
++        }
++        mReceiverPtr = receiverPtr;
+     }
+ 
+     @Override
+@@ -284,6 +296,9 @@ public abstract class DisplayEventReceiver {
+      * Gets the latest vsync event data from surface flinger.
+      */
+     VsyncEventData getLatestVsyncEventData() {
++        if (mReceiverPtr == 0) {
++            return new VsyncEventData();
++        }
+         return nativeGetLatestVsyncEventData(mReceiverPtr);
+     }
+ 
+diff --git a/core/java/android/view/SurfaceControl.java b/core/java/android/view/SurfaceControl.java
+index 92bdfdd4c558..28daec4b5252 100644
+--- a/core/java/android/view/SurfaceControl.java
++++ b/core/java/android/view/SurfaceControl.java
+@@ -2274,7 +2274,7 @@ public final class SurfaceControl implements Parcelable {
+         int[] dataspaces = nativeGetCompositionDataspaces();
+         ColorSpace srgb = ColorSpace.get(ColorSpace.Named.SRGB);
+         ColorSpace[] colorSpaces = { srgb, srgb };
+-        if (dataspaces.length == 2) {
++        if (dataspaces != null && dataspaces.length == 2) {
+             for (int i = 0; i < 2; ++i) {
+                 switch(dataspaces[i]) {
+                     case INTERNAL_DATASPACE_DISPLAY_P3:
+diff --git a/core/jni/fd_utils.cpp b/core/jni/fd_utils.cpp
+index 18bbfe2c411b..fb5e6fb5520c 100644
+--- a/core/jni/fd_utils.cpp
++++ b/core/jni/fd_utils.cpp
+@@ -91,9 +91,15 @@ bool FileDescriptorAllowlist::IsAllowed(const std::string& path) const {
+     }
+ 
+     // Jars from APEXes are allowed. This matches /apex/**/javalib/*.jar.
++    // Halium: also matches /system/apex/**/javalib/*.jar -- APEXes are not activated via
++    // apexd on this device (no real /apex/<name> mount), so bootclasspath entries for APEX
++    // jars point directly at the read-only /system/apex/<name>/javalib/ copy instead.
+     static const char* kApexPrefix = "/apex/";
++    static const char* kSystemApexPrefix = "/system/apex/";
+     static const char* kApexJavalibPathSuffix = "/javalib";
+-    if (android::base::StartsWith(path, kApexPrefix) && android::base::EndsWith(path, kJarSuffix) &&
++    if ((android::base::StartsWith(path, kApexPrefix) ||
++         android::base::StartsWith(path, kSystemApexPrefix)) &&
++        android::base::EndsWith(path, kJarSuffix) &&
+         android::base::EndsWith(android::base::Dirname(path), kApexJavalibPathSuffix)) {
+         return true;
+     }
+diff --git a/services/core/java/com/android/server/display/LocalDisplayAdapter.java b/services/core/java/com/android/server/display/LocalDisplayAdapter.java
+index 58a182a61e44..e341245ba55a 100644
+--- a/services/core/java/com/android/server/display/LocalDisplayAdapter.java
++++ b/services/core/java/com/android/server/display/LocalDisplayAdapter.java
+@@ -98,8 +98,17 @@ final class LocalDisplayAdapter extends DisplayAdapter {
+     public void registerLocked() {
+         super.registerLocked();
+ 
+-        mInjector.setDisplayEventListenerLocked(getHandler().getLooper(),
+-                new LocalDisplayEventListener());
++        // Halium: SurfaceFlinger is not running, so there is no real vsync/hotplug source
++        // for DisplayEventReceiver to connect to -- nativeInit() throws a RuntimeException
++        // (status=-19/ENODEV) which otherwise kills all of system_server. Degrade gracefully
++        // instead of crashing; display hotplug notifications just won't be delivered.
++        try {
++            mInjector.setDisplayEventListenerLocked(getHandler().getLooper(),
++                    new LocalDisplayEventListener());
++        } catch (RuntimeException e) {
++            Slog.w(TAG, "Halium: failed to register display event listener "
++                    + "(no real SurfaceFlinger vsync source), continuing without it", e);
++        }
+ 
+         for (long physicalDisplayId : mSurfaceControlProxy.getPhysicalDisplayIds()) {
+             tryConnectDisplayLocked(physicalDisplayId);
